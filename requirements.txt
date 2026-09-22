@@ -4,3 +4,11 @@ asteroid
 resemblyzer
 thop
 silero-vad
+onnx
+onnxruntime
+pyyaml
+soundfile
+pesq
+pystoi
+librosa
+tqdm

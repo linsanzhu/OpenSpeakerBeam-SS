@@ -1,0 +1,51 @@
+{
+  "summary": {
+    "test_clips": 100,
+    "audio_seconds_per_clip": 10,
+    "model": "checkpoints_50k/best_model.pth",
+    "loss_4epoch_dev": -2.5
+  },
+  "pytorch_vs_onnx_4sec": {
+    "pytorch_si_snr_mean": 1.746,
+    "pytorch_si_snr_median": 1.713,
+    "pytorch_si_snr_max": 9.230,
+    "fp32_si_snr_mean": 1.746,
+    "int8_si_snr_mean": 1.735,
+    "fp32_drift_db": 0.0,
+    "int8_drift_db": 0.009
+  },
+  "test_10sec_full": {
+    "si_sdr_mean": 1.7,
+    "si_sdr_std": 3.41,
+    "pesq_mean": 1.174,
+    "stoi_mean": 0.728
+  },
+  "model_comparison": {
+    "baseline_model_pth": {"si_sdr_mean": 1.44, "si_sdr_std": 6.36, "pesq": 1.244, "stoi": 0.652},
+    "trained_model_pth": {"si_sdr_mean": -1.37, "si_sdr_std": 2.47, "pesq": 1.111, "stoi": 0.716},
+    "50k_trained_pth": {"si_sdr_mean": 1.70, "si_sdr_std": 3.41, "pesq": 1.174, "stoi": 0.728}
+  },
+  "onnx_export": {
+    "fp32_size_mb": 33.24,
+    "int8_size_mb": 12.91,
+    "size_reduction": "2.6x",
+    "int8_drift_mean": 0.00484,
+    "int8_si_snr_diff": -0.013
+  },
+  "training": {
+    "epochs": 4,
+    "batch_size": 8,
+    "lr": 5e-5,
+    "scheduler": "ReduceLROnPlateau(patience=4, factor=0.5)",
+    "loss": "SI-SNR + 0.3 * MR-STFT",
+    "warm_start": "checkpoints_50k/best_model.pth (epoch 1 dev 1.4146)",
+    "final_dev_loss": -2.5
+  },
+  "precompute": {
+    "duration_min": 30.5,
+    "workers": 4,
+    "rate_emb_per_sec": 27.5,
+    "cache_size_mb": 51.2,
+    "cache_entries": 50000
+  }
+}

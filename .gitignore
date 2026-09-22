@@ -1,5 +1,18 @@
+# Python / tooling
 .idea
 __pycache__
-data/train
-data/noise_fullband
-data_csv
+.venv/
+
+# Data + intermediate outputs
+data/
+data_csv/
+logs_50k/
+*.log
+
+# Model artefacts (large binaries; track via DVC / git-lfs if needed)
+checkpoints/
+checkpoints_50k/
+checkpoints_trained/
+exports/
+exports_50k/
+reports/

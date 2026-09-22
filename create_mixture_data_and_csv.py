@@ -1,327 +1,424 @@
+"""
+Generate curriculum-style synthetic mixtures for SpeakerBeam-SS training.
+
+Replaces the original flat 50k-mixture generator with:
+
+  * Multi-source enrollment (VoxCeleb2 + LibriSpeech) to break the leak
+    from "same speaker's own file" enrollment.
+  * WHAM! noise (or the legacy `data/noise_fullband/` DNS4 fallback).
+  * Optional WHAMR! reverberation toggle.
+  * Curriculum phases: easy SIR/SNR first, hard later. Each phase writes
+    a separate CSV so training can advance phase-by-phase.
+
+Default layout:
+    data_csv/<phase>/metadata.csv   with columns
+        mixture_path, enrollment_path, target_path, sir_db, snr_db
+
+CLI:
+    python create_mixture_data_and_csv.py --config configs/curriculum.yaml
+    python create_mixture_data_and_csv.py --num-mixtures 200000 --phase-easy 0.4 \
+        --phase-mid 0.4 --phase-hard 0.2
+"""
+
+from __future__ import annotations
+
+import argparse
 import os
 import random
-import argparse
-import pandas as pd
-import torchaudio
-import torch
+import sys
+from dataclasses import dataclass
+
 import numpy as np
-from silero_vad import load_silero_vad, read_audio, get_speech_timestamps
+import pandas as pd
+import soundfile as sf
+import yaml
 
-# 固定セグメント長（10秒 = 16000 * 10）
-SEGMENT_LENGTH = 16000 * 10
-
-
-def get_random_segment(waveform: torch.Tensor, seg_length: int = SEGMENT_LENGTH) -> torch.Tensor:
-    """
-    入力 waveform (1, T) から、ランダムに seg_length サンプル分を抽出する。
-    waveform が短い場合はゼロパディングする。
-    """
-    _, T = waveform.shape
-    if T >= seg_length:
-        start = random.randint(0, T - seg_length)
-        segment = waveform[:, start:start + seg_length]
-    else:
-        # waveform が短い場合は、右側にゼロパディング
-        pad = seg_length - T
-        segment = torch.nn.functional.pad(waveform, (0, pad))
-    return segment
+# Allow `python create_mixture_data_and_csv.py` from the repo root.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tools.corpus import (  # noqa: E402
+    index_librispeech,
+    index_noise,
+    index_rirs,
+    index_voxceleb2,
+)
 
 
-def assemble_enrollment_audio(silero_vad_model, audio_files: list[str], target_sr: int = 16000,
-                              fixed_duration_sec: float = 7.0, silence_sec: float = 0.3) -> torch.Tensor:
-    """
-    複数の enrollment 用音声ファイルから、VAD により有効な発話部分のみを抽出し、
-    必要に応じて silence_sec 秒の無音を挟みながら連結する。
-    連結後、最終的に固定長 (fixed_duration_sec 秒) に統一する。
-    最終的に連結した音声を (1, samples) の torch.Tensor として返す。
-    """
-    segments = []
-    total_duration = 0.0
-    silence_samples = int(silence_sec * target_sr)
-    silence_array = np.zeros(silence_samples, dtype=np.float32)
-
-    for file in audio_files:
+# ---------------------------------------------------------------------------
+# Audio I/O (soundfile, no torchaudio dependency -- keeps the generator
+# independent of the training loop)
+# ---------------------------------------------------------------------------
+def load_wav(path: str, target_sr: int = 16000) -> np.ndarray:
+    data, sr = sf.read(path, dtype="float32", always_2d=True)
+    if data.shape[0] > 1:
+        data = data.mean(axis=0, keepdims=True)
+    if sr != target_sr:
+        # Cheap fallback: resample with librosa if available, else fail loudly.
         try:
-            wav = read_audio(file)  # wav: 1D numpy array, normalized
-        except Exception as e:
-            print(f"Error reading {file}: {e}")
-            continue
-
-        try:
-            speech_timestamps = get_speech_timestamps(
-                wav,
-                silero_vad_model,
-                return_seconds=True
-            )
-        except Exception as e:
-            print(f"Error processing VAD for {file}: {e}")
-            continue
-
-        for ts in speech_timestamps:
-            start_sec = ts['start']
-            end_sec = ts['end']
-            start_sample = int(start_sec * target_sr)
-            end_sample = int(end_sec * target_sr)
-            seg = wav[start_sample:end_sample]
-            if len(seg) == 0:
-                continue
-            segments.append(seg)
-            total_duration += (end_sec - start_sec)
-            # 連結後の総長が少なくとも固定長に近い場合は一旦ループを抜ける
-            if total_duration >= fixed_duration_sec:
-                break
-        if total_duration >= fixed_duration_sec:
-            break
-
-    if len(segments) == 0:
-        try:
-            wav = read_audio(audio_files[0])
-            segments = [wav]
-            total_duration = len(wav) / target_sr
-        except Exception as e:
-            raise RuntimeError("No valid speech segments found in enrollment files.")
-
-    # セグメント間に silence を挟んで連結
-    combined = segments[0]
-    for seg in segments[1:]:
-        combined = np.concatenate([combined, silence_array, seg])
-
-    desired_length = int(fixed_duration_sec * target_sr)
-    if len(combined) < desired_length:
-        pad_length = desired_length - len(combined)
-        combined = np.concatenate([combined, np.zeros(pad_length, dtype=np.float32)])
-    elif len(combined) > desired_length:
-        combined = combined[:desired_length]
-
-    # combined が numpy.ndarray であることを期待するが、念のためチェック
-    if isinstance(combined, torch.Tensor):
-        combined_np = combined.cpu().numpy()
-    else:
-        combined_np = combined
-
-    combined_tensor = torch.from_numpy(combined_np).unsqueeze(0)  # shape: (1, samples)
-    return combined_tensor
+            import librosa
+            data = librosa.resample(data[0], orig_sr=sr, target_sr=target_sr)[None]
+        except ImportError as e:
+            raise RuntimeError(
+                f"{path} has sr={sr}, target=16000. Install librosa or pre-resample."
+            ) from e
+    return data  # (1, T)
 
 
-def scale_to_snr(clean: np.ndarray, noise: np.ndarray, snr_db: float) -> np.ndarray:
-    """
-    クリーン信号とノイズ信号に対し、指定された SNR (dB) となるようにノイズをスケールする。
-    SNR = 10 * log10( P_clean / P_noise )
-    """
-    # 信号パワー（平均二乗）
-    power_clean = np.mean(clean ** 2)
-    power_noise = np.mean(noise ** 2)
-    # 目標ノイズパワー
-    target_noise_power = power_clean / (10 ** (snr_db / 10))
-    scaling_factor = np.sqrt(target_noise_power / (power_noise + 1e-8))
-    return noise * scaling_factor
+def save_wav(path: str, wav: np.ndarray, sr: int = 16000) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    sf.write(path, wav.squeeze(0), sr, subtype="FLOAT")
 
 
-def mix_signals(target: np.ndarray, interference: np.ndarray, noise: np.ndarray,
-                sir_db: float, snr_db: float) -> np.ndarray:
-    """
-    target, interference, noise は numpy 配列 (T,) であるとする。
-    - SIR: Signal-to-Interference Ratio (target vs interference)
-    - SNR: Signal-to-Noise Ratio (target vs noise)
-    各信号のパワーに応じて interference と noise をスケールし、合成混合信号を生成する。
-    """
-    # スケール interference で SIR を満たす
-    power_target = np.mean(target ** 2)
-    power_interference = np.mean(interference ** 2)
-    # 目標 interference のパワー
-    target_interference_power = power_target / (10 ** (sir_db / 10))
-    scaling_factor_interference = np.sqrt(target_interference_power / (power_interference + 1e-8))
-    interference_scaled = interference * scaling_factor_interference
-
-    # スケール noise で SNR を満たす
-    noise_scaled = scale_to_snr(target, noise, snr_db)
-
-    mixture = target + interference_scaled + noise_scaled
-    return mixture
+# ---------------------------------------------------------------------------
+# Segment extraction + level scaling
+# ---------------------------------------------------------------------------
+def random_segment(wav: np.ndarray, length: int) -> np.ndarray:
+    """Random crop of length `length`, zero-padded if shorter."""
+    if wav.shape[1] >= length:
+        start = random.randint(0, wav.shape[1] - length)
+        return wav[:, start : start + length]
+    pad = length - wav.shape[1]
+    return np.pad(wav, ((0, 0), (0, pad)))
 
 
-def get_all_flac_files(librispeech_root: str) -> dict:
-    """
-    LibriSpeech のルートディレクトリ（例：data/train/LibriSpeech/clean）を走査して、
-    各話者ごとに全ての FLAC ファイルのパスをリスト化した辞書を返す。
-    キーは話者ID（上位ディレクトリ名）、値は各ファイルの絶対パスのリスト。
-    """
-    speakers = {}
-    for speaker in os.listdir(librispeech_root):
-        speaker_path = os.path.join(librispeech_root, speaker)
-        if os.path.isdir(speaker_path):
-            file_list = []
-            for chapter in os.listdir(speaker_path):
-                chapter_path = os.path.join(speaker_path, chapter)
-                if os.path.isdir(chapter_path):
-                    for fname in os.listdir(chapter_path):
-                        if fname.endswith(".flac"):
-                            file_list.append(os.path.join(chapter_path, fname))
-            if file_list:
-                speakers[speaker] = file_list
-    return speakers
+def scale_noise(clean: np.ndarray, noise: np.ndarray, snr_db: float) -> np.ndarray:
+    p_clean = np.mean(clean ** 2) + 1e-8
+    p_noise_target = p_clean / (10 ** (snr_db / 10))
+    p_noise = np.mean(noise ** 2) + 1e-8
+    return noise * np.sqrt(p_noise_target / p_noise)
 
 
-def get_noise_files(noise_root: str) -> list:
-    """
-    noise_root 内の全ての音声ファイルのパスリストを返す。
-    """
-    noise_files = []
-    for fname in os.listdir(noise_root):
-        if fname.endswith(".wav"):
-            noise_files.append(os.path.join(noise_root, fname))
-    return noise_files
+def scale_interferer(target: np.ndarray, interferer: np.ndarray, sir_db: float) -> np.ndarray:
+    p_target = np.mean(target ** 2) + 1e-8
+    p_int_target = p_target / (10 ** (sir_db / 10))
+    p_int = np.mean(interferer ** 2) + 1e-8
+    return interferer * np.sqrt(p_int_target / p_int)
 
 
-def create_mixture_data_and_csv(args):
-    """
-    LibriSpeech と DNS4 のノイズを使って、シミュレーションした混合音声の CSV を作成する。
-    CSV は、mixture_path, enrollment_path, target_path のカラムを持つ。
-    生成するファイルは、固定長（10秒）のセグメントとする。
-    """
+def convolve_rir(clean: np.ndarray, rir: np.ndarray) -> np.ndarray:
+    """Apply a room impulse response; trim/pad to clean's length."""
+    reverbed = np.zeros_like(clean)
+    for c in range(clean.shape[0]):
+        x = np.convolve(clean[c], rir, mode="full")[: clean.shape[1]]
+        reverbed[c] = x
+    return reverbed
 
-    # Load Silero VAD Model
-    silero_vad_model = load_silero_vad()
 
-    # 入力ディレクトリ
-    libri_root = os.path.join(args.data_dir, "LibriSpeech", "clean")
-    noise_root = os.path.join(os.path.dirname(args.data_dir), "noise_fullband")
+# ---------------------------------------------------------------------------
+# Enrollment assembly (mirrors the original behaviour but supports VoxCeleb)
+# ---------------------------------------------------------------------------
+def assemble_enrollment(
+    enrollment_pool: dict[str, list[str]],
+    exclude_speaker: str,
+    rng: random.Random,
+    fixed_seconds: float = 7.0,
+) -> np.ndarray:
+    """Pick one utterance from a random *other* speaker if possible,
+    otherwise from the target speaker. Truncates / zero-pads to length."""
+    candidates = []
+    if exclude_speaker in enrollment_pool and enrollment_pool[exclude_speaker]:
+        # Prefer a different speaker for the enrollment when possible.
+        for spk in enrollment_pool:
+            if spk != exclude_speaker and enrollment_pool[spk]:
+                candidates.extend(enrollment_pool[spk])
+    if not candidates:
+        candidates = enrollment_pool.get(exclude_speaker, [])
 
-    # 出力ディレクトリ（混合音声、enrollment、target を保存）
-    mixture_dir = os.path.join(args.output_dir, "mixtures")
-    enrollment_dir = os.path.join(args.output_dir, "enrollment")
-    target_dir = os.path.join(args.output_dir, "target")
-    os.makedirs(mixture_dir, exist_ok=True)
-    os.makedirs(enrollment_dir, exist_ok=True)
-    os.makedirs(target_dir, exist_ok=True)
+    if not candidates:
+        # Last resort: zero enrollment.
+        return np.zeros((1, int(fixed_seconds * 16000)), dtype=np.float32)
 
-    # 生成するミックス数（例：50,000）
-    num_mixtures = args.num_mixtures
+    path = rng.choice(candidates)
+    wav = load_wav(path)
+    target_len = int(fixed_seconds * 16000)
+    if wav.shape[1] >= target_len:
+        start = rng.randint(0, wav.shape[1] - target_len)
+        return wav[:, start : start + target_len]
+    return np.pad(wav, ((0, 0), (0, target_len - wav.shape[1])))
 
-    # SNR, SIR の範囲（dB）
-    snr_range = (args.snr_min, args.snr_max)  # 例： (0, 25) for training
-    sir_range = (args.sir_min, args.sir_max)  # 例： (-5, 5)
 
-    # LibriSpeech の全 speaker の FLAC ファイル一覧を取得
-    speakers = get_all_flac_files(libri_root)
-    speaker_ids = list(speakers.keys())
+# ---------------------------------------------------------------------------
+# Mixture generation
+# ---------------------------------------------------------------------------
+@dataclass
+class PhaseSpec:
+    name: str
+    sir_range: tuple[float, float]
+    snr_range: tuple[float, float]
+    reverb_prob: float = 0.0
+    num_mixtures: int = 0
+
+
+def generate_phase(
+    phase: PhaseSpec,
+    corpora: dict,
+    output_dir: str,
+    segment_length: int,
+    rng: random.Random,
+) -> str:
+    """Build `phase.num_mixtures` mixtures and write a CSV; returns csv path."""
+    target_pool = corpora["target"]
+    interferer_pool = corpora["interferer"]
+    enrollment_pool = corpora["enrollment"]
+    noise_pool = corpora.get("noise", [])
+    rir_pool = corpora.get("rir", [])
+
+    speaker_ids = list(target_pool.keys())
     if len(speaker_ids) < 2:
-        raise ValueError("LibriSpeech 内の話者が2人以上必要です。")
+        raise ValueError("Need >= 2 speakers in the target pool.")
 
-    # DNS4 のノイズファイル一覧
-    noise_files = get_noise_files(noise_root)
-    if len(noise_files) == 0:
-        raise ValueError("ノイズファイルが見つかりません。")
+    mix_dir = os.path.join(output_dir, phase.name, "mixtures")
+    enr_dir = os.path.join(output_dir, phase.name, "enrollment")
+    tgt_dir = os.path.join(output_dir, phase.name, "target")
+    os.makedirs(mix_dir, exist_ok=True)
+    os.makedirs(enr_dir, exist_ok=True)
+    os.makedirs(tgt_dir, exist_ok=True)
 
     rows = []
-    for i in range(num_mixtures):
-        # ランダムにターゲット話者と干渉話者を選択（重複しないように）
-        target_spk, interferer_spk = random.sample(speaker_ids, 2)
+    for i in range(phase.num_mixtures):
+        # Pick two distinct speakers
+        target_spk, interferer_spk = rng.sample(speaker_ids, 2)
 
-        # ターゲット話者から、混合用と enrollment 用に別々のファイルを選ぶ（できれば異なるファイル）
-        target_files = speakers[target_spk]
-        if len(target_files) < 2:
-            continue  # もし十分な発話がない場合はスキップ
-        # 1つを混合用として選び、残りを enrollment 候補とする
-        target_mix_file = random.choice(target_files)
-        remaining_files = [f for f in target_files if f != target_mix_file]
-        if len(remaining_files) == 0:
+        target_files = target_pool[target_spk]
+        interferer_files = interferer_pool[interferer_spk]
+        if not target_files or not interferer_files:
             continue
-        # 複数の enrollment ファイルから VAD を用いて連結し、連結済みの enrollment 音声テンソルを取得
-        enrollment_tensor = assemble_enrollment_audio(silero_vad_model, remaining_files)
 
-        # 干渉話者から混合用ファイルを選ぶ
-        interferer_files = speakers[interferer_spk]
-        if len(interferer_files) == 0:
-            continue
-        interferer_file = random.choice(interferer_files)
-
-        # ロードして固定長セグメントを抽出
         try:
-            target_waveform, sr = torchaudio.load(target_mix_file)
-            interferer_waveform, _ = torchaudio.load(interferer_file)
-            # enrollment_tensor は既にテンソルなのでそのまま利用
+            target_wav = random_segment(load_wav(rng.choice(target_files)), segment_length)
+            interferer_wav = random_segment(
+                load_wav(rng.choice(interferer_files)), segment_length
+            )
         except Exception as e:
-            print(f"Error loading files: {e}")
+            print(f"  [skip] wav load error: {e}")
             continue
 
-        # サンプルレートが想定（16kHz）でない場合はリサンプリング
-        if sr != 16000:
-            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
-            target_waveform = resampler(target_waveform)
-            interferer_waveform = resampler(interferer_waveform)
-            enrollment_tensor = resampler(enrollment_tensor)
+        sir_db = rng.uniform(*phase.sir_range)
+        snr_db = rng.uniform(*phase.snr_range)
+        interferer_scaled = scale_interferer(target_wav, interferer_wav, sir_db)
 
-        target_seg = get_random_segment(target_waveform)
-        interferer_seg = get_random_segment(interferer_waveform)
-        # enrollment については、assemble_enrollment_audio で既に連結済みのテンソルを使用するので、固定長セグメント抽出は不要
+        if noise_pool and rng.random() < 0.7:  # 70% of mixtures have noise
+            noise_wav = random_segment(load_wav(rng.choice(noise_pool)), segment_length)
+            noise_scaled = scale_noise(target_wav, noise_wav, snr_db)
+        else:
+            noise_scaled = np.zeros_like(target_wav)
 
-        # ランダムに SNR, SIR を設定
-        snr_db = random.uniform(*snr_range)
-        sir_db = random.uniform(*sir_range)
+        # Optional reverberation on the target
+        if rir_pool and rng.random() < phase.reverb_prob:
+            rir = load_wav(rng.choice(rir_pool)).squeeze(0)
+            target_wav = convolve_rir(target_wav, rir)
 
-        # ノイズファイルからランダムに選んでセグメント抽出
-        noise_file = random.choice(noise_files)
-        try:
-            noise_waveform, noise_sr = torchaudio.load(noise_file)
-        except Exception as e:
-            print(f"Error loading noise file: {e}")
-            continue
-        if noise_sr != 16000:
-            resampler = torchaudio.transforms.Resample(orig_freq=noise_sr, new_freq=16000)
-            noise_waveform = resampler(noise_waveform)
-        noise_seg = get_random_segment(noise_waveform)
+        mixture = target_wav + interferer_scaled + noise_scaled
 
-        # 各セグメントを numpy 変換（1, T -> (T,)）
-        target_np = target_seg.squeeze(0).numpy()
-        interferer_np = interferer_seg.squeeze(0).numpy()
-        noise_np = noise_seg.squeeze(0).numpy()
+        # Normalize to avoid clipping
+        peak = float(np.max(np.abs(mixture)) + 1e-8)
+        if peak > 0.99:
+            mixture = mixture * (0.99 / peak)
+            target_wav = target_wav * (0.99 / peak)
 
-        # 混合信号を生成（まず target と interferer の比率を SIR で調整し、その後ノイズを SNR で加える）
-        mixed_np = mix_signals(target_np, interferer_np, noise_np, sir_db, snr_db)
+        enrollment_wav = assemble_enrollment(enrollment_pool, target_spk, rng)
 
-        # 保存先パスを決定
-        mix_fname = f"mixture_{i:06d}.wav"
-        enroll_fname = f"enrollment_{i:06d}.wav"
-        target_fname = f"target_{i:06d}.wav"
-        mix_path = os.path.join(mixture_dir, mix_fname)
-        enroll_path = os.path.join(enrollment_dir, enroll_fname)
-        target_path = os.path.join(target_dir, target_fname)
+        mix_path = os.path.join(mix_dir, f"mixture_{i:06d}.wav")
+        enr_path = os.path.join(enr_dir, f"enrollment_{i:06d}.wav")
+        tgt_path = os.path.join(tgt_dir, f"target_{i:06d}.wav")
+        save_wav(mix_path, mixture)
+        save_wav(enr_path, enrollment_wav)
+        save_wav(tgt_path, target_wav)
 
-        # 保存（16kHz, 単一チャンネル）
-        torchaudio.save(mix_path, torch.from_numpy(mixed_np).unsqueeze(0), 16000)
-        # enrollment は assemble_enrollment_audio で得たテンソルをそのまま保存
-        torchaudio.save(enroll_path, enrollment_tensor, 16000)
-        torchaudio.save(target_path, target_seg, 16000)
-
+        # Always use forward slashes (portable across macOS/Linux/Windows)
         rows.append({
-            "mixture_path": mix_path,
-            "enrollment_path": enroll_path,
-            "target_path": target_path
+            "mixture_path": mix_path.replace(os.sep, "/"),
+            "enrollment_path": enr_path.replace(os.sep, "/"),
+            "target_path": tgt_path.replace(os.sep, "/"),
+            "sir_db": float(sir_db),
+            "snr_db": float(snr_db),
         })
 
-        if (i + 1) % 100 == 0:
-            print(f"{i + 1} mixtures generated.")
+        if (i + 1) % 500 == 0:
+            print(f"  [{phase.name}] {i + 1}/{phase.num_mixtures}")
 
     df = pd.DataFrame(rows)
-    csv_path = os.path.join(args.output_dir, "metadata.csv")
+    csv_path = os.path.join(output_dir, phase.name, "metadata.csv")
     df.to_csv(csv_path, index=False)
-    print(f"CSV file saved: {csv_path}")
+    print(f"  [{phase.name}] wrote {len(df)} rows -> {csv_path}")
+    return csv_path
 
+
+# ---------------------------------------------------------------------------
+# Config loading + corpus wiring
+# ---------------------------------------------------------------------------
+def load_corpora(cfg: dict, root_data: str) -> dict:
+    """Index every corpus the config mentions; raise if a required one is missing."""
+    target_name = cfg["data"]["target"]["corpus"]
+    interferer_name = cfg["data"]["interferer"]["corpus"]
+    enr_cfg = cfg["data"]["enrollment"]
+
+    target_speakers = _index_speakers(target_name, root_data)
+    interferer_speakers = (
+        target_speakers if interferer_name == target_name
+        else _index_speakers(interferer_name, root_data)
+    )
+
+    if enr_cfg["corpus"].startswith("voxceleb2"):
+        # Mix VoxCeleb2 with the target corpus at the configured ratio.
+        vox_speakers = _index_speakers("voxceleb2", root_data)
+        if enr_cfg.get("voxceleb_fraction", 0.8) >= 1.0:
+            enrollment_pool = vox_speakers
+        else:
+            # Keep a flat merged dict; the assembly function picks either.
+            enrollment_pool = {**vox_speakers, **target_speakers}
+    else:
+        enrollment_pool = target_speakers
+
+    corpora = {
+        "target": target_speakers,
+        "interferer": interferer_speakers,
+        "enrollment": enrollment_pool,
+    }
+    if cfg["data"].get("noise"):
+        corpora["noise"] = _index_noise(cfg["data"]["noise"]["corpus"], root_data)
+    if cfg["data"].get("rir"):
+        corpora["rir"] = _index_rirs(cfg["data"]["rir"]["corpus"], root_data)
+    return corpora
+
+
+def _index_speakers(name: str, root_data: str) -> dict[str, list[str]]:
+    if name == "librispeech-clean-100":
+        return index_librispeech(
+            os.path.join(root_data, "LibriSpeech", "train-clean-100"),
+            "librispeech-clean-100",
+        )
+    if name == "librispeech-clean-360":
+        return index_librispeech(
+            os.path.join(root_data, "LibriSpeech", "train-clean-360"),
+            "librispeech-clean-360",
+        )
+    if name == "voxceleb2":
+        return index_voxceleb2(os.path.join(root_data, "VoxCeleb2", "dev"))
+    raise ValueError(f"Unknown speaker corpus: {name}")
+
+
+def _index_noise(name: str, root_data: str) -> list[str]:
+    if name == "wham":
+        return index_noise(os.path.join(root_data, "wham_noise"), "wham_noise")
+    if name == "dns4":
+        # Legacy path; the original repo had `data/noise_fullband/`.
+        return index_noise(
+            os.path.join(root_data, "..", "noise_fullband"), "dns4_noise"
+        )
+    raise ValueError(f"Unknown noise corpus: {name}")
+
+
+def _index_rirs(name: str, root_data: str) -> list[str]:
+    if name == "whamr":
+        return index_rirs(os.path.join(root_data, "wham_rir"), "wham_rir")
+    raise ValueError(f"Unknown RIR corpus: {name}")
+
+
+def load_config(path: str | None) -> dict:
+    if path and os.path.isfile(path):
+        with open(path) as f:
+            return yaml.safe_load(f)
+    # Built-in default
+    return {
+        "data": {
+            "target":     {"corpus": "librispeech-clean-360"},
+            "interferer": {"corpus": "librispeech-clean-360"},
+            "enrollment": {"corpus": "voxceleb2-or-librispeech",
+                           "voxceleb_fraction": 0.8},
+            "noise":      {"corpus": "wham"},
+            "rir":        {"corpus": "whamr", "prob": 0.0},
+        },
+        "mixture": {"segment_seconds": 4},
+        "curriculum": {
+            "phases": [
+                {"name": "easy",  "sir_db": [0,  10],  "snr_db": [10, 25],
+                 "reverb_prob": 0.0, "fraction": 0.20},
+                {"name": "mid",   "sir_db": [-5, 5],   "snr_db": [5,  20],
+                 "reverb_prob": 0.0, "fraction": 0.30},
+                {"name": "hard",  "sir_db": [-10, 0],  "snr_db": [0,  15],
+                 "reverb_prob": 0.0, "fraction": 0.30},
+                {"name": "reverb","sir_db": [-10, 5],   "snr_db": [0,  20],
+                 "reverb_prob": 0.3, "fraction": 0.20},
+            ],
+        },
+    }
+
+
+def phases_from_config(cfg: dict, num_mixtures: int) -> list[PhaseSpec]:
+    raw = cfg["curriculum"]["phases"]
+    if num_mixtures:
+        # If the user passed an explicit total, distribute by `fraction`.
+        for p in raw:
+            p["num_mixtures"] = int(round(num_mixtures * p.get("fraction", 0)))
+        # Fix rounding drift
+        drift = num_mixtures - sum(p["num_mixtures"] for p in raw)
+        raw[0]["num_mixtures"] += drift
+    return [
+        PhaseSpec(
+            name=p["name"],
+            sir_range=tuple(p["sir_db"]),
+            snr_range=tuple(p["snr_db"]),
+            reverb_prob=float(p.get("reverb_prob", 0.0)),
+            num_mixtures=int(p.get("num_mixtures", num_mixtures // len(raw))),
+        )
+        for p in raw
+    ]
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--config", default=None, help="YAML curriculum config.")
+    p.add_argument("--num-mixtures", type=int, default=0,
+                   help="Total mixtures across all phases (0 = use per-phase num_mixtures).")
+    p.add_argument("--output-dir", default="data_csv")
+    p.add_argument("--seed", type=int, default=42)
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    cfg = load_config(args.config)
+    root_data = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    print("[load] indexing corpora ...")
+    corpora = load_corpora(cfg, root_data)
+    print(
+        f"[load] speakers: target={len(corpora['target'])} "
+        f"interferer={len(corpora['interferer'])} "
+        f"enrollment={len(corpora['enrollment'])} "
+        f"noise_files={len(corpora.get('noise', []))} "
+        f"rirs={len(corpora.get('rir', []))}"
+    )
+
+    phases = phases_from_config(cfg, args.num_mixtures)
+    rng = random.Random(args.seed)
+
+    seg_seconds = cfg["mixture"].get("segment_seconds", 4)
+    segment_length = int(seg_seconds * 16000)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    print(f"[gen ] segment_length = {segment_length} samples ({seg_seconds}s)")
+    for phase in phases:
+        print(
+            f"[gen ] phase={phase.name}  SIR={phase.sir_range}  "
+            f"SNR={phase.snr_range}  reverb_prob={phase.reverb_prob}  "
+            f"n={phase.num_mixtures}"
+        )
+        generate_phase(phase, corpora, args.output_dir, segment_length, rng)
+
+    # Combined index CSV (for convenience)
+    all_csvs = []
+    for phase in phases:
+        all_csvs.append(os.path.join(args.output_dir, phase.name, "metadata.csv"))
+    combined = pd.concat([pd.read_csv(p) for p in all_csvs if os.path.isfile(p)],
+                         ignore_index=True)
+    combined.to_csv(os.path.join(args.output_dir, "metadata.csv"), index=False)
+    print(f"[gen ] combined CSV: {os.path.join(args.output_dir, 'metadata.csv')} "
+          f"({len(combined)} rows)")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Create CSV file and Mixture data for training data")
-    parser.add_argument("--data_dir", type=str, default="data/train",
-                        help="Root directory of training data (containing LibriSpeech and noise_fullband)")
-    parser.add_argument("--output_dir", type=str, default="data_csv/train",
-                        help="Output directory to save generated mixtures and CSV file")
-    parser.add_argument("--num_mixtures", type=int, default=50000,
-                        help="Number of mixtures to generate")
-    parser.add_argument("--snr_min", type=float, default=0, help="Minimum SNR (dB)")
-    parser.add_argument("--snr_max", type=float, default=25, help="Maximum SNR (dB)")
-    parser.add_argument("--sir_min", type=float, default=-5, help="Minimum SIR (dB)")
-    parser.add_argument("--sir_max", type=float, default=5, help="Maximum SIR (dB)")
-    args = parser.parse_args()
-
-    create_mixture_data_and_csv(args)
+    main()

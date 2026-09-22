@@ -1,0 +1,30 @@
+# Curriculum-style mixture config used for the 50 k multi-epoch training run.
+# Mixes LibriSpeech-360 (speech) + WHAM! (noise) into 4 phases of increasing
+# difficulty. Reverb is enabled only in the last phase (room impulse responses
+# from WHAMR! are optional; leave rir.prob=0.0 to skip them).
+
+data:
+  target:      { corpus: librispeech-clean-360 }
+  interferer:  { corpus: librispeech-clean-360 }
+  enrollment:  { corpus: librispeech-clean-360 }   # same-speaker is acceptable
+                                                   # because we control the
+                                                   # enrollment-vs-target split
+                                                   # in create_mixture_data_and_csv
+  noise:       { corpus: wham }
+  rir:         { corpus: whamr, prob: 0.0 }         # flip to 0.3 for reverb
+
+mixture:
+  segment_seconds: 4                                # 4-s crops
+
+curriculum:
+  phases:
+    # Easy: target is dominant, noise is mild. Model learns the basic
+    # speaker-conditioned beam quickly.
+    - { name: easy,   sir_db: [0,   10], snr_db: [10, 25], reverb_prob: 0.0, fraction: 0.25 }
+    # Mid: comparable levels. Model must learn interference suppression.
+    - { name: mid,    sir_db: [-5,   5], snr_db: [ 5, 20], reverb_prob: 0.0, fraction: 0.30 }
+    # Hard: target is buried under noise + interferer.
+    - { name: hard,   sir_db: [-10,  0], snr_db: [ 0, 15], reverb_prob: 0.0, fraction: 0.30 }
+    # Reverb (kept at reverb_prob=0 because WHAMR! RIRs are not downloaded
+    # in this run; flip prob to 0.3 if you also `tools/download_datasets.py --datasets whamr`).
+    - { name: reverb, sir_db: [-10,  5], snr_db: [ 0, 20], reverb_prob: 0.0, fraction: 0.15 }
